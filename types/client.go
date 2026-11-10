@@ -2,6 +2,7 @@ package types
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -38,7 +39,29 @@ const (
 
 	// recvReadBufferSize 接收端 bufio 读缓冲大小，需大于单条最大消息（块 + JSON 头）
 	recvReadBufferSize = 512 * 1024
+
+	// tcpSocketBufferSize 底层套接字收发缓冲大小（见 tuneTCP）
+	tcpSocketBufferSize = 4 << 20
 )
+
+// tuneTCP 放大底层 TCP 连接的收发缓冲。
+//
+// Windows 默认的套接字缓冲区很小（未显式设置时接收窗口常在几十 KB 量级），
+// 接收端「读网络 → 写磁盘」是串行的：一旦它停下来写盘，内核没有余量继续收包，
+// 发送端随即被 TCP 窗口顶住，整条链路就变成「网络等磁盘、磁盘等网络」的交替停顿。
+// 放大到 4MB 后内核可以替应用先缓冲一到几秒的数据，读写真正并行。
+// 本项目回环实测：400MB 文件由 373 MB/s 提升到 700 MB/s（明细见 transfer_bench_test.go）。
+// 4MB 而不是 1MB，是为了给高 RTT 链路（WiFi / 千兆以上局域网）留足带宽时延积。
+func tuneTCP(conn net.Conn) {
+	if tc, ok := conn.(*tls.Conn); ok {
+		conn = tc.NetConn()
+	}
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetReadBuffer(tcpSocketBufferSize)
+		_ = tcp.SetWriteBuffer(tcpSocketBufferSize)
+	}
+}
 
 // fileOfferRequest 待用户确认的文件/文件夹请求
 type fileOfferRequest struct {
@@ -421,8 +444,15 @@ func (c *ChatClient) startTCPListener() error {
 		// 使用 0.0.0.0 绑定所有接口
 		listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 		if err == nil {
-			c.tcpListener = listener
+			// 安全加固：所有入站连接强制 TLS（自签证书，见 security.go），
+			// 聊天内容与文件数据不再以明文出现在局域网上
+			c.tcpListener = tls.NewListener(listener, tlsServerConfig())
 			c.tcpPort = port
+			// 打印本机 TLS 身份（证书路径 + 指纹），便于确认两端身份是否一致
+			if info, err := LocalCertInfo(); err == nil {
+				c.logf("本机加密证书: %s", info.Path)
+				c.logf("本机证书指纹: %s", info.Fingerprint)
+			}
 			go c.acceptTCPConnections()
 			return nil
 		}
@@ -441,6 +471,7 @@ func (c *ChatClient) acceptTCPConnections() {
 			continue
 		}
 
+		tuneTCP(conn)
 		go c.handleIncomingConnection(conn)
 	}
 }
@@ -591,7 +622,10 @@ func (c *ChatClient) connectToPeer(targetPeer *common.Peer) bool {
 	for i, address := range addresses {
 		c.logf("连接尝试 %d/%d 到 %s...", i+1, len(addresses), address)
 
-		conn, err = net.DialTimeout("tcp", address, 5*time.Second)
+		// 安全加固：出站连接同样走 TLS（对端为自签证书，跳过公共CA校验，
+		// 保证链路机密性与完整性，防局域网被动嗅探，见 security.go）
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second},
+			"tcp", address, tlsClientConfig())
 		if err == nil {
 			// 防止TCP自连：对端实际指向本机自己的监听端口时立即断开，
 			// 绝不建立"自己跟自己聊天"的会话（即使错误的fallback地址也无法绕过）
@@ -601,6 +635,7 @@ func (c *ChatClient) connectToPeer(targetPeer *common.Peer) bool {
 				conn = nil
 				err = fmt.Errorf("目标 %s 是本机自己，不能与自己聊天", address)
 			} else {
+				tuneTCP(conn)
 				break
 			}
 		}
@@ -1497,11 +1532,21 @@ func (c *ChatClient) handleFileOffer(msg *common.Message, conn net.Conn) {
 		}
 
 		var savePath string
-		// 根据相对路径创建目录结构
-		if msg.RelativePath != "" {
-			savePath = filepath.Join(folderInfo.FolderPath, msg.RelativePath)
-		} else {
-			savePath = filepath.Join(folderInfo.FolderPath, msg.FileName)
+		// 安全加固：相对路径远端可控，必须清洗并校验不逃逸出接收目录
+		// （防 ..\、盘符、绝对路径等路径遍历攻击，见 security.go）
+		rel := msg.RelativePath
+		if rel == "" {
+			rel = msg.FileName
+		}
+		safeRel, err := sanitizeRelativePath(rel)
+		if err != nil {
+			c.logf("已拒绝危险路径的文件 %q: %v", rel, err)
+			return
+		}
+		savePath, err = safeJoinUnder(folderInfo.FolderPath, safeRel)
+		if err != nil {
+			c.logf("已拒绝逃逸接收目录的路径 %q: %v", rel, err)
+			return
 		}
 
 		// 创建必要的目录结构
@@ -1539,13 +1584,20 @@ func (c *ChatClient) AcceptFile(fileID string) {
 
 	// 创建保存文件的完整路径
 	dir := c.FileDataDir() // 一次性取值，避免改名过程中路径分裂到两个目录
-	savePath := filepath.Join(dir, req.msg.FileName)
+
+	// 安全加固：文件名远端可控，清洗后再落盘（防路径遍历）
+	safeName, err := sanitizeFileName(req.msg.FileName)
+	if err != nil {
+		c.logf("已拒绝危险文件名 %q: %v", req.msg.FileName, err)
+		return
+	}
+	savePath := filepath.Join(dir, safeName)
 
 	// 检查文件是否已存在，如果存在则添加时间戳
 	if _, err := os.Stat(savePath); err == nil {
 		timestamp := time.Now().Format("20060102_150405")
-		ext := filepath.Ext(req.msg.FileName)
-		baseName := strings.TrimSuffix(req.msg.FileName, ext)
+		ext := filepath.Ext(safeName)
+		baseName := strings.TrimSuffix(safeName, ext)
 		savePath = filepath.Join(dir, fmt.Sprintf("%s_%s%s", baseName, timestamp, ext))
 	}
 
@@ -2037,6 +2089,13 @@ func (c *ChatClient) AcceptFolder(folderID string) {
 		return
 	}
 
+	// 安全加固：文件夹名远端可控，清洗后再落盘（防路径遍历）
+	safeFolderName, err := sanitizeFileName(req.msg.FolderName)
+	if err != nil {
+		c.logf("已拒绝危险文件夹名 %q: %v", req.msg.FolderName, err)
+		return
+	}
+
 	// 创建保存文件夹的完整路径
 	dir := c.FileDataDir()
 	folderSavePath := ""
@@ -2044,18 +2103,18 @@ func (c *ChatClient) AcceptFolder(folderID string) {
 	// 协议 v2：如果同名目录里留着「上次没传完」的标记，且文件夹标识一致，
 	// 就继续往这个目录里写，里面的 .lcpart 会被逐个文件续传复用
 	if req.msg.Proto >= protoV2 && req.msg.FileKey != "" {
-		candidate := filepath.Join(dir, req.msg.FolderName)
+		candidate := filepath.Join(dir, safeFolderName)
 		if key, ok := readFolderMarker(candidate); ok && key == req.msg.FileKey {
 			folderSavePath = candidate
 		}
 	}
 
 	if folderSavePath == "" {
-		folderSavePath = filepath.Join(dir, req.msg.FolderName)
+		folderSavePath = filepath.Join(dir, safeFolderName)
 		// 检查文件夹是否已存在，如果存在则添加时间戳
 		if _, err := os.Stat(folderSavePath); err == nil {
 			timestamp := time.Now().Format("20060102_150405")
-			folderSavePath = filepath.Join(dir, fmt.Sprintf("%s_%s", req.msg.FolderName, timestamp))
+			folderSavePath = filepath.Join(dir, fmt.Sprintf("%s_%s", safeFolderName, timestamp))
 		}
 	}
 

@@ -5,10 +5,14 @@ package types
 
 import (
 	"crypto/sha256"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +26,14 @@ func TestTransferThroughput(t *testing.T) {
 	}
 
 	const portBase = 4600
-	const sizeMB = 20
+	// 文件大小可用 LOCALCHAT_BENCH_MB 覆盖：短测默认 20MB，
+	// 要看分块/加密的真实开销时放大到 400MB，避免固定开销淹没结果
+	sizeMB := 20
+	if v := os.Getenv("LOCALCHAT_BENCH_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			sizeMB = n
+		}
+	}
 
 	os.RemoveAll("received_files")
 	defer os.RemoveAll("received_files")
@@ -137,6 +148,65 @@ func TestTransferThroughput(t *testing.T) {
 		t.Fatal("内容校验失败：接收文件与源文件不一致")
 	}
 	t.Log("内容校验通过（SHA-256 一致）")
+}
+
+// TestTuneTCPWorksOnTLSConn 确认 tuneTCP 能穿过 TLS 包装拿到真实 TCP 连接并完成设置，
+// 且设置后链路依然可用（NetConn() 取错对象会让后续所有传输静默失效）。
+func TestTuneTCPWorksOnTLSConn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	tlsLn := tls.NewListener(ln, tlsServerConfig())
+
+	done := make(chan error, 1)
+	go func() {
+		c, err := tlsLn.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer c.Close()
+		tuneTCP(c)
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(c, buf); err != nil {
+			done <- err
+			return
+		}
+		_, err = c.Write(buf)
+		done <- err
+	}()
+
+	c, err := tls.Dial("tcp", ln.Addr().String(), tlsClientConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	tuneTCP(c)
+
+	if _, err := c.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "hello" {
+		t.Fatalf("回显内容不符: %q", buf)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTuneTCPIgnoresNonTCPConn 对非 TCP 连接（如 net.Pipe）必须安静地什么都不做
+func TestTuneTCPIgnoresNonTCPConn(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	tuneTCP(a) // 不应 panic
+	tuneTCP(nil)
 }
 
 // TestFolderThroughput 小文件文件夹传输基准：验证「每文件 100ms 轮询等待」的固定开销

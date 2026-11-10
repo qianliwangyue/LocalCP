@@ -3,10 +3,10 @@ package types
 import (
 	"bufio"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -329,7 +329,9 @@ func TestLegacyPeerCompat(t *testing.T) {
 	b.Start()
 	t.Cleanup(b.Stop)
 
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", b.TCPPort()))
+	// TCP 通道已启用 TLS（安全加固），测试的「旧版对端」同样通过 TLS 连接，
+	// 模拟的仅是旧协议格式（纯 JSON + base64），而非旧传输层
+	conn, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", b.TCPPort()), tlsClientConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
